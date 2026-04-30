@@ -1,127 +1,31 @@
 use anyhow::Result;
-use dynasmrt::{dynasm, DynasmApi, ExecutableBuffer};
-use iced_x86::{Decoder, DecoderOptions};
-use std::ffi::c_void;
 use std::ptr::NonNull;
+use windows::Win32::System::Diagnostics::Debug::*;
 use windows::Win32::System::Memory::*;
+use windows::Win32::System::Threading::*;
 
-const MAX_INSTRUCTION_LEN: usize = 15;
+mod dissassembler;
+mod memory;
 
-pub struct Hooker {}
+pub struct KoyHook {}
 
-impl Hooker {
+impl KoyHook {
     pub fn new() -> Self {
         Self {}
     }
-    fn create_jmp(func: *const u8) -> ExecutableBuffer {
-        let mut ops = dynasmrt::x64::Assembler::new().unwrap();
-
-        dynasm!(ops
-                ; .arch x64
-                ; mov rax, QWORD func as _
-                ; jmp rax
-        );
-
-        ops.finalize().unwrap()
-    }
-    fn create_call(func: *const u8) -> ExecutableBuffer {
-        let mut ops = dynasmrt::x64::Assembler::new().unwrap();
-
-        dynasm!(ops
-                ; .arch x64
-                ; mov rax, QWORD func as _
-                ; call rax
-        );
-
-        ops.finalize().unwrap()
-    }
-    fn calculate_overwrite_size(func: NonNull<u8>, len: usize) -> Option<usize> {
-        // Length plus max instruction length so we dont chop off any instructions when overwriting bytes
-        let data = std::ptr::slice_from_raw_parts::<u8>(func.as_ptr(), len + MAX_INSTRUCTION_LEN);
-
-        let decoder = Decoder::new(64, unsafe { &*data }, DecoderOptions::NONE).into_iter();
-
-        let mut current_size = 0;
-        for ins in decoder {
-            current_size += ins.len();
-            if current_size >= len {
-                break;
-            }
-        }
-
-        // SAFETY if we break from the loop without having a size higher than len we
-        // will return None because there is not enough space to overwrite bytes
-        if current_size < len {
-            None
-        } else {
-            Some(current_size)
-        }
-    }
-    fn copy_bytes(ptr: NonNull<u8>, size: usize) -> Vec<u8> {
-        let mut bytes = vec![0u8; size];
-        unsafe { ptr.as_ptr().copy_to(bytes.as_mut_ptr(), size) };
-
-        bytes
-    }
-    fn push_registers() -> ExecutableBuffer {
-        let mut ops = dynasmrt::x64::Assembler::new().unwrap();
-
-        dynasm!(ops
-                ; .arch x64
-                ; push rax
-                ; push rcx
-                ; push rdx
-                ; push rbx
-                ; push rsi
-                ; push rdi
-                ; push r8
-                ; push r9
-                ; push r10
-                ; push r11
-                ; push r12
-                ; push r13
-                ; push r14
-                ; push r15
-        );
-
-        ops.finalize().unwrap()
-    }
-    fn pop_registers() -> ExecutableBuffer {
-        let mut ops = dynasmrt::x64::Assembler::new().unwrap();
-
-        dynasm!(ops
-                ; .arch x64
-                ; pop r15
-                ; pop r14
-                ; pop r13
-                ; pop r12
-                ; pop r11
-                ; pop r10
-                ; pop r9
-                ; pop r8
-                ; pop rdi
-                ; pop rsi
-                ; pop rbx
-                ; pop rdx
-                ; pop rcx
-                ; pop rax
-        );
-
-        ops.finalize().unwrap()
-    }
     pub fn trampoline_hook(&self, target: NonNull<u8>, detour: NonNull<u8>) -> Result<()> {
-        let detour_call = Self::create_call(detour.as_ptr());
+        let detour_call = dissassembler::create_call(detour.as_ptr());
 
         // hard coded as 12 for now because jmp byte count is always 12
-        let size = Self::calculate_overwrite_size(target, 12)
+        let size = dissassembler::calculate_size_rel_to_ins(target, 12)
             .expect("Failed to get corrent length for function instructions");
 
-        let target_jmp = Self::create_jmp(unsafe { target.byte_add(size) }.as_ptr());
+        let target_jmp = dissassembler::create_jmp(unsafe { target.byte_add(size) }.as_ptr());
 
-        let overwrite_bytes = Self::copy_bytes(target, size);
+        let overwrite_bytes = memory::copy_bytes(target, size);
 
-        let push_registers = Self::push_registers();
-        let pop_registers = Self::pop_registers();
+        let push_registers = dissassembler::push_registers();
+        let pop_registers = dissassembler::pop_registers();
 
         let trampoline_total_size = target_jmp.len()
             + detour_call.len()
@@ -139,67 +43,66 @@ impl Hooker {
             )
         };
 
-        let trampoline_jmp = Self::create_jmp(original_address.cast::<u8>());
+        let trampoline_jmp = dissassembler::create_jmp(original_address.cast::<u8>());
 
         println!("Trampoline address = {original_address:p}");
 
         let trampoline_address = NonNull::new(original_address).unwrap().cast::<u8>();
 
         // First write push registers so we can save the registers for calling the original func
-        let trampoline_address = copy_bytes_to_memory(
+        let trampoline_address = memory::copy_bytes_to_memory(
             trampoline_address,
             push_registers.ptr(dynasmrt::AssemblyOffset(0)),
             push_registers.len(),
         );
 
         // Then we call our detour func
-        let trampoline_address = copy_bytes_to_memory(
+        let trampoline_address = memory::copy_bytes_to_memory(
             trampoline_address,
             detour_call.ptr(dynasmrt::AssemblyOffset(0)),
             detour_call.len(),
         );
 
         // pop all registers after detour func
-        let trampoline_address = copy_bytes_to_memory(
+        let trampoline_address = memory::copy_bytes_to_memory(
             trampoline_address,
             pop_registers.ptr(dynasmrt::AssemblyOffset(0)),
             pop_registers.len(),
         );
 
         // write back overwritten bytes
-        let trampoline_address = copy_bytes_to_memory(
+        let trampoline_address = memory::copy_bytes_to_memory(
             trampoline_address,
             overwrite_bytes.as_ptr(),
             overwrite_bytes.len(),
         );
 
-        let _ = copy_bytes_to_memory(
+        let _ = memory::copy_bytes_to_memory(
             trampoline_address,
             target_jmp.ptr(dynasmrt::AssemblyOffset(0)),
             target_jmp.len(),
         );
 
-        copy_bytes_to_readable_memory(
-            target,
-            trampoline_jmp.ptr(dynasmrt::AssemblyOffset(0)),
-            trampoline_jmp.len(),
-        )?;
-
         unsafe {
-            overwrite_memory_protections(
+            memory::overwrite_memory_protections(
                 original_address,
                 trampoline_total_size,
                 PAGE_EXECUTE_READ,
             )?;
         }
 
+        memory::copy_bytes_to_readable_memory(
+            target,
+            trampoline_jmp.ptr(dynasmrt::AssemblyOffset(0)),
+            trampoline_jmp.len(),
+        )?;
+
         Ok(())
     }
-
     pub fn inline_hook(&self, target: NonNull<u8>, detour: NonNull<u8>) -> Result<()> {
-        let detour_jmp = Self::create_jmp(detour.as_ptr());
+        let detour_jmp = dissassembler::create_jmp(detour.as_ptr());
 
-        copy_bytes_to_readable_memory(
+        memory::copy_bytes_to_readable_memory(
             target,
             detour_jmp.ptr(dynasmrt::AssemblyOffset(0)),
             detour_jmp.len(),
@@ -207,37 +110,87 @@ impl Hooker {
 
         Ok(())
     }
-}
 
-pub unsafe fn overwrite_memory_protections(
-    ptr: *mut c_void,
-    size: usize,
-    flags: PAGE_PROTECTION_FLAGS,
-) -> Result<PAGE_PROTECTION_FLAGS> {
-    unsafe {
-        let mut old_protect: PAGE_PROTECTION_FLAGS = std::mem::zeroed();
-        VirtualProtect(ptr, size, flags, &mut old_protect)?;
-        Ok(old_protect)
+    pub fn overwrite_hook(&self, target: NonNull<u8>, detour: NonNull<u8>) -> Result<NonNull<u8>> {
+        let (target_size, target_extra_size) = dissassembler::calculate_function_size(target);
+        let (detour_size, _) = dissassembler::calculate_function_size(detour);
+
+        let mut target_bytes = memory::copy_bytes(target, target_size);
+        let mut detour_bytes = memory::copy_bytes(detour, detour_size);
+
+        let new_target = NonNull::new(unsafe {
+            VirtualAlloc(None, target_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) as *mut u8
+        })
+        .unwrap();
+
+        dissassembler::fixup_func_relatives(
+            &mut target_bytes,
+            new_target.addr().into(),
+            target.addr().into(),
+            None,
+        );
+
+        memory::copy_bytes_to_memory(new_target, target_bytes.as_ptr(), target_size);
+
+        unsafe {
+            memory::overwrite_memory_protections(
+                new_target.as_ptr() as _,
+                target_size,
+                PAGE_EXECUTE_READ,
+            )?;
+        }
+
+        //dissassembler::fixup(target_bytes);
+        dissassembler::fixup_func_relatives(
+            &mut detour_bytes,
+            target.addr().into(),
+            detour.addr().into(),
+            Some(new_target.addr().into()),
+        );
+
+        let difference = detour_size as i64 - target_size as i64;
+
+        // Then we can overwrite bytes from target with detour
+        if difference <= target_extra_size as i64 {
+            println!("Difference is less than extra bytes overwriting target! {target:?}");
+            memory::copy_bytes_to_readable_memory(target, detour_bytes.as_ptr(), detour_size);
+
+            // TODO find out if flushing cache actually matters
+            unsafe {
+                let handle = GetCurrentProcess();
+                FlushInstructionCache(handle, Some(target.as_ptr() as _), detour_size)
+            };
+        } else {
+            let new_size = (detour_size as i64
+                - difference
+                - dissassembler::JMP_LEN as i64
+                - dissassembler::MAX_INSTRUCTION_LEN as i64) as usize;
+
+            let detour_new_size =
+                dissassembler::calculate_size_rel_to_ins(detour, new_size).unwrap();
+
+            let left_over = detour_size - detour_new_size;
+
+            memory::copy_bytes_to_readable_memory(target, detour_bytes.as_ptr(), detour_new_size);
+
+            let detour_branch = NonNull::new(unsafe {
+                VirtualAlloc(None, left_over, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) as *mut u8
+            })
+            .unwrap();
+
+            let jmp_bytes = dissassembler::create_jmp(detour_branch.as_ptr());
+
+            let mut detour_branch_bytes = vec![];
+            detour_branch_bytes.extend_from_slice(&detour_bytes[detour_new_size..]);
+
+            dissassembler::fixup_func_relatives(
+                &mut detour_branch_bytes,
+                detour_branch.addr().into(),
+                detour.addr().into(),
+                Some(new_target.addr().into()),
+            );
+        }
+
+        Ok(target)
     }
-}
-
-pub fn copy_bytes_to_memory(dst: NonNull<u8>, src: *const u8, size: usize) -> NonNull<u8> {
-    unsafe {
-        dst.as_ptr().copy_from(src, size);
-        dst.add(size)
-    }
-}
-
-pub fn copy_bytes_to_readable_memory(dst: NonNull<u8>, src: *const u8, size: usize) -> Result<()> {
-    // SAFETY: This write is safe because pointers are know to be nonnull so we can overwrite memory without an access violation
-    unsafe {
-        let old_protect =
-            overwrite_memory_protections(dst.as_ptr() as _, size, PAGE_EXECUTE_READWRITE)?;
-
-        dst.as_ptr().copy_from(src, size);
-
-        overwrite_memory_protections(dst.as_ptr() as _, size, old_protect)?;
-    }
-
-    Ok(())
 }
