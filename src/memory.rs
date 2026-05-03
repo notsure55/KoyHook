@@ -36,9 +36,27 @@ pub fn copy_bytes_to_readable_memory(dst: NonNull<u8>, src: *const u8, size: usi
     Ok(())
 }
 
-pub fn copy_bytes(ptr: NonNull<u8>, size: usize) -> Vec<u8> {
+pub fn allocate(size: usize) -> NonNull<u8> {
+    NonNull::new(unsafe {
+        VirtualAlloc(None, size, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE)
+    })
+    .unwrap()
+    .cast::<u8>()
+}
+
+pub fn copy_bytes(ptr: &NonNull<u8>, size: usize) -> Vec<u8> {
     let mut bytes = vec![0u8; size];
     unsafe { ptr.as_ptr().copy_to(bytes.as_mut_ptr(), size) };
 
     bytes
+}
+
+pub fn relocate_function(original_addr: &NonNull<u8>, size: usize) -> Result<NonNull<u8>> {
+    let target_bytes = copy_bytes(original_addr, size);
+
+    let new_addr = allocate(size);
+
+    copy_bytes_to_memory(new_addr, target_bytes.as_ptr(), target_bytes.len());
+
+    Ok(new_addr)
 }

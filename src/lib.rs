@@ -1,8 +1,6 @@
 use anyhow::Result;
 use std::ptr::NonNull;
-use windows::Win32::System::Diagnostics::Debug::*;
 use windows::Win32::System::Memory::*;
-use windows::Win32::System::Threading::*;
 
 mod dissassembler;
 mod memory;
@@ -17,12 +15,12 @@ impl KoyHook {
         let detour_call = dissassembler::create_call(detour.as_ptr());
 
         // hard coded as 12 for now because jmp byte count is always 12
-        let size = dissassembler::calculate_size_rel_to_ins(target, 12)
+        let size = dissassembler::calculate_size_rel_to_ins(&target, 12)
             .expect("Failed to get corrent length for function instructions");
 
         let target_jmp = dissassembler::create_jmp(unsafe { target.byte_add(size) }.as_ptr());
 
-        let overwrite_bytes = memory::copy_bytes(target, size);
+        let overwrite_bytes = memory::copy_bytes(&target, size);
 
         let push_registers = dissassembler::push_registers();
         let pop_registers = dissassembler::pop_registers();
@@ -111,86 +109,106 @@ impl KoyHook {
         Ok(())
     }
 
-    pub fn overwrite_hook(&self, target: NonNull<u8>, detour: NonNull<u8>) -> Result<NonNull<u8>> {
-        let (target_size, target_extra_size) = dissassembler::calculate_function_size(target);
-        let (detour_size, _) = dissassembler::calculate_function_size(detour);
+    pub fn relocate_target(target: &NonNull<u8>, size: usize) -> Result<NonNull<u8>> {
+        let new_target = memory::allocate(size);
 
-        let mut target_bytes = memory::copy_bytes(target, target_size);
-        let mut detour_bytes = memory::copy_bytes(detour, detour_size);
+        log::info!(
+            "Relocating target function! {:p} Current size = {size:X}",
+            new_target
+        );
 
-        let new_target = NonNull::new(unsafe {
-            VirtualAlloc(None, target_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) as *mut u8
-        })
-        .unwrap();
+        let mut target_bytes = memory::copy_bytes(target, size);
 
         dissassembler::fixup_func_relatives(
             &mut target_bytes,
             new_target.addr().into(),
             target.addr().into(),
             None,
-        );
+            None,
+        )?;
 
-        memory::copy_bytes_to_memory(new_target, target_bytes.as_ptr(), target_size);
+        log::info!("New size of target = {:X}", target_bytes.len());
 
-        unsafe {
-            memory::overwrite_memory_protections(
-                new_target.as_ptr() as _,
-                target_size,
-                PAGE_EXECUTE_READ,
-            )?;
-        }
+        let _ = memory::copy_bytes_to_memory(new_target, target_bytes.as_ptr(), target_bytes.len());
 
-        //dissassembler::fixup(target_bytes);
-        dissassembler::fixup_func_relatives(
-            &mut detour_bytes,
-            target.addr().into(),
-            detour.addr().into(),
-            Some(new_target.addr().into()),
-        );
+        Ok(new_target)
+    }
 
-        let difference = detour_size as i64 - target_size as i64;
+    pub fn relocate_detour(
+        detour: &NonNull<u8>,
+        size: usize,
+        target_old_location: &NonNull<u8>,
+        target_new_location: &NonNull<u8>,
+        size_diff: i32,
+    ) -> Result<NonNull<u8>> {
+        let mut detour_bytes = memory::copy_bytes(detour, size);
 
-        // Then we can overwrite bytes from target with detour
-        if difference <= target_extra_size as i64 {
-            println!("Difference is less than extra bytes overwriting target! {target:?}");
-            memory::copy_bytes_to_readable_memory(target, detour_bytes.as_ptr(), detour_size);
+        let detour_leftovers = if size_diff > 0 {
+            log::info!("Detour larger than Target allocating extraspace for detour!");
+            let difference =
+                dissassembler::calculate_size_rel_to_ins(detour, size - size_diff as usize - 12)
+                    .unwrap();
 
-            // TODO find out if flushing cache actually matters
-            unsafe {
-                let handle = GetCurrentProcess();
-                FlushInstructionCache(handle, Some(target.as_ptr() as _), detour_size)
-            };
-        } else {
-            let new_size = (detour_size as i64
-                - difference
-                - dissassembler::JMP_LEN as i64
-                - dissassembler::MAX_INSTRUCTION_LEN as i64) as usize;
+            // NEED 12 extra bytes for jmp at end
+            let mut leftover_bytes: Vec<u8> = detour_bytes.drain(difference..).collect();
 
-            let detour_new_size =
-                dissassembler::calculate_size_rel_to_ins(detour, new_size).unwrap();
-
-            let left_over = detour_size - detour_new_size;
-
-            memory::copy_bytes_to_readable_memory(target, detour_bytes.as_ptr(), detour_new_size);
-
-            let detour_branch = NonNull::new(unsafe {
-                VirtualAlloc(None, left_over, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) as *mut u8
-            })
-            .unwrap();
-
-            let jmp_bytes = dissassembler::create_jmp(detour_branch.as_ptr());
-
-            let mut detour_branch_bytes = vec![];
-            detour_branch_bytes.extend_from_slice(&detour_bytes[detour_new_size..]);
+            let leftover_addr = memory::allocate(leftover_bytes.len());
 
             dissassembler::fixup_func_relatives(
-                &mut detour_branch_bytes,
-                detour_branch.addr().into(),
-                detour.addr().into(),
-                Some(new_target.addr().into()),
+                &mut leftover_bytes,
+                leftover_addr.addr().into(),
+                usize::from(detour.addr()) + difference,
+                Some(target_old_location.addr().into()),
+                Some(target_new_location.addr().into()),
+            )?;
+
+            memory::copy_bytes_to_memory(
+                leftover_addr,
+                leftover_bytes.as_ptr(),
+                leftover_bytes.len(),
             );
+
+            log::info!("Done setting up extraspace for detour! {leftover_addr:p}");
+
+            let leftovers_jmp = dissassembler::create_jmp1(leftover_addr.addr().into())?;
+
+            Some(leftovers_jmp)
+        } else {
+            None
+        };
+
+        dissassembler::fixup_func_relatives(
+            &mut detour_bytes,
+            target_old_location.addr().into(),
+            detour.addr().into(),
+            Some(target_old_location.addr().into()),
+            Some(target_new_location.addr().into()),
+        )?;
+
+        if let Some(leftovers_jmp) = detour_leftovers {
+            detour_bytes.extend(leftovers_jmp);
         }
 
-        Ok(target)
+        memory::copy_bytes_to_readable_memory(
+            *target_old_location,
+            detour_bytes.as_ptr(),
+            detour_bytes.len(),
+        );
+
+        Ok(*detour)
+    }
+
+    pub fn overwrite_hook(&self, target: NonNull<u8>, detour: NonNull<u8>) -> Result<()> {
+        let (target_size, target_extra_size) = dissassembler::calculate_function_size(target);
+        let (detour_size, _) = dissassembler::calculate_function_size(detour);
+
+        let new_target = Self::relocate_target(&target, target_size)?;
+
+        let size_diff = i32::try_from(detour_size)?
+            - (i32::try_from(target_size)? + i32::try_from(target_extra_size)?);
+
+        let _ = Self::relocate_detour(&detour, detour_size, &target, &new_target, size_diff)?;
+
+        Ok(())
     }
 }
