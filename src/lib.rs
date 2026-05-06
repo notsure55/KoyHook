@@ -11,7 +11,7 @@ impl KoyHook {
     pub fn new() -> Self {
         Self {}
     }
-    pub fn trampoline_hook(&self, target: NonNull<u8>, detour: NonNull<u8>) -> Result<()> {
+    /*pub fn trampoline_hook(&self, target: NonNull<u8>, detour: NonNull<u8>) -> Result<()> {
         let detour_call = dissassembler::create_call(detour.as_ptr());
 
         // hard coded as 12 for now because jmp byte count is always 12
@@ -107,60 +107,34 @@ impl KoyHook {
         )?;
 
         Ok(())
-    }
+    }*/
 
-    pub fn relocate_target(target: &NonNull<u8>, size: usize) -> Result<NonNull<u8>> {
-        let new_target = memory::allocate(size);
+    pub fn relocate_target(target: &NonNull<u8>, bytes: Vec<u8>) -> Result<NonNull<u8>> {
+        let new_target = memory::allocate(bytes.len());
 
-        log::info!(
-            "Relocating target function! {:p} Current size = {size:X}",
-            new_target
-        );
-
-        let mut target_bytes = memory::copy_bytes(target, size);
-
-        dissassembler::fixup_func_relatives(
-            &mut target_bytes,
-            new_target.addr().into(),
-            target.addr().into(),
-            None,
-            None,
-        )?;
-
-        log::info!("New size of target = {:X}", target_bytes.len());
-
-        let _ = memory::copy_bytes_to_memory(new_target, target_bytes.as_ptr(), target_bytes.len());
+        let _ = memory::copy_bytes_to_memory(new_target, bytes.as_ptr(), bytes.len());
 
         Ok(new_target)
     }
 
     pub fn relocate_detour(
         detour: &NonNull<u8>,
-        size: usize,
+        mut bytes: Vec<u8>,
         target_old_location: &NonNull<u8>,
-        target_new_location: &NonNull<u8>,
         size_diff: i32,
     ) -> Result<NonNull<u8>> {
-        let mut detour_bytes = memory::copy_bytes(detour, size);
-
         let detour_leftovers = if size_diff > 0 {
             log::info!("Detour larger than Target allocating extraspace for detour!");
-            let difference =
-                dissassembler::calculate_size_rel_to_ins(detour, size - size_diff as usize - 12)
-                    .unwrap();
+            let difference = dissassembler::calculate_size_rel_to_ins(
+                &bytes,
+                bytes.len() - size_diff as usize - 12,
+            )
+            .unwrap();
 
             // NEED 12 extra bytes for jmp at end
-            let mut leftover_bytes: Vec<u8> = detour_bytes.drain(difference..).collect();
+            let mut leftover_bytes: Vec<u8> = bytes.drain(difference..).collect();
 
             let leftover_addr = memory::allocate(leftover_bytes.len());
-
-            dissassembler::fixup_func_relatives(
-                &mut leftover_bytes,
-                leftover_addr.addr().into(),
-                usize::from(detour.addr()) + difference,
-                Some(target_old_location.addr().into()),
-                Some(target_new_location.addr().into()),
-            )?;
 
             memory::copy_bytes_to_memory(
                 leftover_addr,
@@ -170,45 +144,47 @@ impl KoyHook {
 
             log::info!("Done setting up extraspace for detour! {leftover_addr:p}");
 
-            let leftovers_jmp = dissassembler::create_jmp1(leftover_addr.addr().into())?;
+            let leftovers_jmp = lifter::create_jmp1(usize::from(leftover_addr.addr()) as u64)?;
 
             Some(leftovers_jmp)
         } else {
             None
         };
 
-        dissassembler::fixup_func_relatives(
-            &mut detour_bytes,
-            target_old_location.addr().into(),
-            detour.addr().into(),
-            Some(target_old_location.addr().into()),
-            Some(target_new_location.addr().into()),
-        )?;
-
         if let Some(leftovers_jmp) = detour_leftovers {
-            detour_bytes.extend(leftovers_jmp);
+            bytes.extend(leftovers_jmp);
         }
 
-        memory::copy_bytes_to_readable_memory(
-            *target_old_location,
-            detour_bytes.as_ptr(),
-            detour_bytes.len(),
-        );
+        memory::copy_bytes_to_readable_memory(*target_old_location, bytes.as_ptr(), bytes.len());
 
-        Ok(*detour)
+        Ok(*target_old_location)
     }
 
-    pub fn overwrite_hook(&self, target: NonNull<u8>, detour: NonNull<u8>) -> Result<()> {
+    pub fn overwrite_hook(&self, target: NonNull<u8>, detour: NonNull<u8>) -> Result<NonNull<u8>> {
         let (target_size, target_extra_size) = dissassembler::calculate_function_size(target);
         let (detour_size, _) = dissassembler::calculate_function_size(detour);
 
-        let new_target = Self::relocate_target(&target, target_size)?;
+        let dissassembler = lifter::Dissassembler::new();
+
+        let target_bytes = memory::copy_bytes(&target, target_size);
+        let target_bytes = dissassembler
+            .dissassemble_function(&target_bytes, usize::from(target.addr()) as u64)
+            .to_bytes()?;
+
+        let new_target = Self::relocate_target(&target, target_bytes)?;
 
         let size_diff = i32::try_from(detour_size)?
             - (i32::try_from(target_size)? + i32::try_from(target_extra_size)?);
 
-        let _ = Self::relocate_detour(&detour, detour_size, &target, &new_target, size_diff)?;
+        let detour_bytes = memory::copy_bytes(&detour, target_size);
+        let detour_bytes = dissassembler
+            .dissassemble_function(&detour_bytes, usize::from(detour.addr()) as u64)
+            .to_bytes()?;
 
-        Ok(())
+        let new_detour = Self::relocate_detour(&detour, detour_bytes, &target, size_diff)?;
+
+        log::info!("{new_target:p}, {new_detour:p}");
+
+        Ok(new_target)
     }
 }
