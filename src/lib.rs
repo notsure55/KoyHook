@@ -5,6 +5,8 @@ use windows::Win32::System::Memory::*;
 mod dissassembler;
 mod memory;
 
+use lifter::Dissassembler;
+
 pub struct KoyHook {}
 
 impl KoyHook {
@@ -109,8 +111,25 @@ impl KoyHook {
         Ok(())
     }*/
 
-    pub fn relocate_target(target: &NonNull<u8>, bytes: Vec<u8>) -> Result<NonNull<u8>> {
-        let new_target = memory::allocate(bytes.len());
+    pub fn relocate_target(
+        target: &NonNull<u8>,
+        size: usize,
+        dissassembler: &Dissassembler,
+    ) -> Result<NonNull<u8>> {
+        let new_target = memory::allocate(size);
+
+        let bytes = memory::copy_bytes(&target, size);
+
+        let mut function =
+            dissassembler.dissassemble_function(&bytes, usize::from(target.addr()) as u64);
+
+        log::info!("Original target = {function}");
+
+        let relocated_function = function.fix_relocations(usize::from(new_target.addr()) as u64)?;
+
+        log::info!("Relocated target = {relocated_function}");
+
+        let bytes = relocated_function.to_bytes()?;
 
         let _ = memory::copy_bytes_to_memory(new_target, bytes.as_ptr(), bytes.len());
 
@@ -119,10 +138,25 @@ impl KoyHook {
 
     pub fn relocate_detour(
         detour: &NonNull<u8>,
-        mut bytes: Vec<u8>,
+        size: usize,
         target_old_location: &NonNull<u8>,
         size_diff: i32,
+        dissassembler: &Dissassembler,
     ) -> Result<NonNull<u8>> {
+        let bytes = memory::copy_bytes(&detour, size);
+
+        let mut function =
+            dissassembler.dissassemble_function(&bytes, usize::from(detour.addr()) as u64);
+
+        log::info!("Original detour = {function}");
+
+        let relocated_function =
+            function.fix_relocations(usize::from(target_old_location.addr()) as u64)?;
+
+        log::info!("Relocated detour = {relocated_function}");
+
+        let mut bytes = relocated_function.to_bytes()?;
+
         let detour_leftovers = if size_diff > 0 {
             log::info!("Detour larger than Target allocating extraspace for detour!");
             let difference = dissassembler::calculate_size_rel_to_ins(
@@ -166,22 +200,13 @@ impl KoyHook {
 
         let dissassembler = lifter::Dissassembler::new();
 
-        let target_bytes = memory::copy_bytes(&target, target_size);
-        let target_bytes = dissassembler
-            .dissassemble_function(&target_bytes, usize::from(target.addr()) as u64)
-            .to_bytes()?;
-
-        let new_target = Self::relocate_target(&target, target_bytes)?;
+        let new_target = Self::relocate_target(&target, target_size, &dissassembler)?;
 
         let size_diff = i32::try_from(detour_size)?
             - (i32::try_from(target_size)? + i32::try_from(target_extra_size)?);
 
-        let detour_bytes = memory::copy_bytes(&detour, target_size);
-        let detour_bytes = dissassembler
-            .dissassemble_function(&detour_bytes, usize::from(detour.addr()) as u64)
-            .to_bytes()?;
-
-        let new_detour = Self::relocate_detour(&detour, detour_bytes, &target, size_diff)?;
+        let new_detour =
+            Self::relocate_detour(&detour, detour_size, &target, size_diff, &dissassembler)?;
 
         log::info!("{new_target:p}, {new_detour:p}");
 

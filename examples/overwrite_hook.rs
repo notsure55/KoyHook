@@ -12,7 +12,11 @@ static ORIGINAL_PRINT_NAME: OnceLock<PrintNameT> = OnceLock::new();
 fn print_name_hk(name: &str, value: i32) -> i32 {
     println!("Hooked! input value was = {name}");
 
-    let value = ORIGINAL_PRINT_NAME.get().unwrap()(name, value);
+    let value = if let Some(print_name) = ORIGINAL_PRINT_NAME.get() {
+        print_name(name, value)
+    } else {
+        0
+    };
 
     value + 1
 }
@@ -36,7 +40,6 @@ fn main() -> Result<()> {
 
     ORIGINAL_PRINT_NAME.set(original_print_name);
 
-    //loop {}
     for i in 0..10 {
         let val = print_name("koy", i);
         println!("{val}");
