@@ -196,19 +196,16 @@ impl KoyHook {
 
     pub fn overwrite_hook(&self, target: NonNull<u8>, detour: NonNull<u8>) -> Result<NonNull<u8>> {
         let (target_size, target_extra_size) = dissassembler::calculate_function_size(target);
-        let (detour_size, _) = dissassembler::calculate_function_size(detour);
 
         let dissassembler = lifter::Dissassembler::new();
 
         let new_target = Self::relocate_target(&target, target_size, &dissassembler)?;
 
-        let size_diff = i32::try_from(detour_size)?
-            - (i32::try_from(target_size)? + i32::try_from(target_extra_size)?);
+        let jmp_bytes = lifter::create_jmp1(usize::from(detour.addr()) as u64)?;
 
-        let new_detour =
-            Self::relocate_detour(&detour, detour_size, &target, size_diff, &dissassembler)?;
+        memory::copy_bytes_to_readable_memory(target, jmp_bytes.as_ptr(), jmp_bytes.len());
 
-        log::info!("{new_target:p}, {new_detour:p}");
+        log::info!("{new_target:p}");
 
         Ok(new_target)
     }
