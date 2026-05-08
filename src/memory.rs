@@ -50,13 +50,3 @@ pub fn copy_bytes(ptr: &NonNull<u8>, size: usize) -> Vec<u8> {
 
     bytes
 }
-
-pub fn relocate_function(original_addr: &NonNull<u8>, size: usize) -> Result<NonNull<u8>> {
-    let target_bytes = copy_bytes(original_addr, size);
-
-    let new_addr = allocate(size);
-
-    copy_bytes_to_memory(new_addr, target_bytes.as_ptr(), target_bytes.len());
-
-    Ok(new_addr)
-}

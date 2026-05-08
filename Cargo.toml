@@ -5,10 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.102"
-dynasm = "5.0.0"
-dynasmrt = "5.0.0"
 iced-x86 = "1.21.0"
-num-traits = "0.2.19"
 log = "0.4.29"
 
 [dependencies.windows]
